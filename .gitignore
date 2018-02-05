@@ -106,3 +106,4 @@ ENV/
 
 docker-compose
 hostfile
+app/build/
