@@ -8,11 +8,6 @@ from struct import pack, unpack
 from socklib import sendobj
 
 
-_global_node = None
-
-def log(msg):
-    with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(os.getpid())), 'a') as f:
-        print('{}({}): {}\n'.format(_global_node.id, os.getpid(), msg), file=f, flush=True)
 
 class Message:
 
@@ -56,26 +51,30 @@ class Message:
 
 class MQueue:
 
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
+    def __init__(self, id, host, port):
+        self.local_node = Node(self, host, port, id=id)
         self._sock = socket()
         self._lock = RLock()
-        self._cond = Condition(self._lock)
+        self._msg_cond = Condition(self._lock)
         self._event_thread = Thread(target=self.event_loop)
         self._sel = Selector()
         self._msgbuf = []
         self._nodes = {}
         self.size = None
-        self._env_cond = Condition(self._lock)
+        self._nodes_cond = Condition(self._lock)
+
+    def log(self, msg, *args):
+        with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(self.local_node.id)), 'a') as f:
+            print('{}({}): {}'.format(self.local_node.id, os.getpid(), msg.format(*args)), file=f, flush=True)
 
     def event_loop(self):
         while True:
-            # log('Waiting for event...')
+            # self.log('Waiting for event...')
             for key, events in self._sel.select():
                 try:
-                    # log('Event in event_log: {}'.format(key))
-                    key.data['handler'](key.fileobj, key.data)
+                    # self.log('Event in event_log: {}', key)
+                    if 'handler' in key.data:
+                        key.data['handler'](key.fileobj, key.data)
                 except (EOFError, OSError) as e:
                     if not isinstance(e, EOFError):
                         print(e, file=sys.stderr)
@@ -83,7 +82,7 @@ class MQueue:
 
     def connect_handler(self, sock, data):
         c, a = self._sock.accept()
-        # log('New connection from {} - {}'.format(a, c))
+        self.log('New connection from {}', a)
         self._sel.register(c, EVENT_READ, {'handler': self.raw_handler})
 
     def _extract_msg(self, sock, data):
@@ -100,48 +99,51 @@ class MQueue:
         msg = self._extract_msg(sock, data)
         if msg.iscomplete():
             data = msg.getdata()
-            log('Message received: {}'.format(data))
+            self.log('Message received: {} from {}', data, sock.getpeername())
             if 'nodes' in data and 'total-node-count' in data:
-                log('Coordinator: Nodes: {}, total count: {}'.format(data['nodes'], data['total-node-count']))
-                with self._lock:
-                    for id, host, port in data['nodes']:
-                        node = Node(self, id=id)
-                        node.connect(host, port)
                 self._sel.unregister(sock)
                 sock.close()
+                nodes = data['nodes']
+                count = data['total-node-count']
+                self.log('Coordinator: Nodes: {}, total count: {}', nodes, count)
                 with self._lock:
-                    self.size = data['total-node-count']
-            elif 'node-id' in data:
-                log('Node-id from {}: {}'.format(sock, data['node-id']))
+                    self.size = count
+                    self.log('Setting self.size = {}', self.size)
+                    self._nodes_cond.notify_all()
+                for id, host, port in nodes:
+                    node = Node(self, host, port, id=id)
+                    node.connect()
+            elif 'node-info' in data:
+                id, host, port = map(lambda k: data['node-info'][k], ['id', 'host', 'port'])
                 with self._lock:
-                    self._nodes[data['node-id']] = Node(self, sock=sock)
-                    self._sel.modify(sock, EVENT_READ, {'handler': self.message_handler, 'node': self._nodes[data['node-id']]})
-                    log('receive {} {}'.format(len(self._nodes), self._nodes))
-                    self._env_cond.notify_all()
+                    self._nodes[id] = Node(self, host, port, sock=sock, id=id)
+                    self.log('New node (connection from {}): {} (total nodes: {} {})', sock.getpeername(), id, len(self._nodes), self._nodes)
+                    self._sel.modify(sock, EVENT_READ, {'handler': self.message_handler, 'node': self._nodes[id]})
+                    self._nodes_cond.notify_all()
 
     def message_handler(self, sock, data):
         try:
             msg = self._extract_msg(sock, data)
         except EOFError:
-            log('Node {} disconnected'.format(data['node']))
+            # self.log('Node {} disconnected', data['node'])
             with self._lock:
                 del self._nodes[data['node'].id]
             raise
         except OSError as ose:
-            log('Node {} disconnected due to an error'.format(data['node']))
+            # self.log('Node {} disconnected due to an error', data['node'])
             raise
         if msg.iscomplete():
             with self._lock:
-                # log('Message from {}: {}'.format(data['node'].id, msg.getdata()))
+                # self.log('Message from {}: {}', data['node'].id, msg.getdata())
                 self._msgbuf.append({'node': data['node'], 'data': msg.getdata()})
-                self._cond.notify_all()
+                self._msg_cond.notify_all()
 
     def register(self, node):
         with self._lock:
             self._nodes[node.id] = node
             self._sel.register(node.sock, EVENT_READ, {'handler': self.message_handler, 'node': node})
-            log('connect {} {}'.format(len(self._nodes), self._nodes))
-            self._env_cond.notify_all()
+            self.log('New node (connection to {} using {}): {} (total nodes: {} {})', node.sock.getpeername(), node.sock.getsockname(), node.id, len(self._nodes), self._nodes)
+            self._nodes_cond.notify_all()
 
     def send(self, id, msg):
         with self._lock:
@@ -150,12 +152,13 @@ class MQueue:
     def wait_for_init(self):
         with self._lock:
             while self.size is None or len(self._nodes) < self.size - 1:
-                self._env_cond.wait()
+                self.log('In wait: self.size: {}, len(self._nodes): {}', self.size, len(self._nodes))
+                self._nodes_cond.wait()
 
     def start(self):
-        log('Starting MQueue...')
+        # self.log('Starting MQueue...')
         self._sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self._sock.bind((self.host, self.port))
+        self._sock.bind((self.local_node.host, self.local_node.port))
         self._sock.listen(5)
         self._sel.register(self._sock, EVENT_READ, {'handler': self.connect_handler})
         self._event_thread.start()
@@ -163,33 +166,38 @@ class MQueue:
 
 class Node:
 
-    def __init__(self, mqueue, *, sock=None, id=None):
+    def __init__(self, mqueue, host, port, *, id=None, sock=None):
         self.mqueue = mqueue
-        self.sock = sock
+        self.host = host
+        self.port = port
         self.id = id
+        self.sock = sock
 
-    def connect(self, host, port):
-        log('Connecting to {} ({}:{})'.format(self.id, host, port))
+    def __repr__(self):
+        return 'Node [{}] at {}:{}'.format(self.id, self.host, self.port)
+
+    def connect(self):
         self.sock = socket()
-        self.sock.connect((host, port))
-        sendobj(self.sock, {'node-id': self.id})
+        self.sock.connect((self.host, self.port))
+        self.mqueue.log('Connected to {} ({}:{}) using {}', self.id, self.host, self.port, self.sock.getsockname())
+        sendobj(self.sock, {'node-info': {a: getattr(self.mqueue.local_node, a) for a in ['id', 'host', 'port']}})
         self.mqueue.register(self)
 
     def loop(self):
         while True:
             sleep(10)
 
+
+
 def main(id, host, port):
-    mqueue = MQueue(host, port)
-    print('LISTEN_OK', flush=True)
-    global _global_node
-    _global_node = Node(mqueue, id=id)
-    log('before start...')
+    mqueue = MQueue(id, host, port)
+    mqueue.log('Starting node {} at {}:{}', id, host, port)
     mqueue.start()
-    log('waiting for init...')
+    print('LISTEN_OK', flush=True)
+    mqueue.log('waiting for init...')
     mqueue.wait_for_init()
-    log(('initialized', mqueue._nodes))
-    _global_node.loop()
+    mqueue.log('initialized: {}', mqueue._nodes)
+    mqueue.local_node.loop()
 
 
 if __name__ == '__main__':

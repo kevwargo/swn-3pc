@@ -13,9 +13,9 @@ def main(nodes_info):
     for id, host, port in map(lambda n: n.split(':'), nodes_info):
         try:
             args = ['python3', os.path.join(os.path.dirname(sys.argv[0]), 'node.py'), id, host, port]
-            log('before {}'.format(args))
+            log('before {}'.format(['node'] + args[2:]))
             nodes.append((id, Popen(args, stdout=PIPE, stderr=PIPE)))
-            log('after {}'.format(args))
+            log('after {}'.format(['node'] + args[2:]))
         except:
             for i, node in nodes:
                 node.terminate()
@@ -23,7 +23,7 @@ def main(nodes_info):
     pids = []
     for id, node in nodes:
         status = node.stdout.readline().strip()
-        log('status from {}: {} {}'.format(node, status, node.returncode))
+        log('status from {}: {} {}'.format(['node'] + node.args[2:], status, node.returncode))
         if status == b'LISTEN_OK':
             pids.append(node.pid)
         else:

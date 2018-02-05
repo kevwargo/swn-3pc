@@ -112,8 +112,9 @@ def main(procnum, hostnames):
                 s.connect((host, port))
             except ConnectionError as ce:
                 print(ce, (host, port))
-            print('Sending {} to {} ({}:{})'.format({'total-node-count': len(nodes), 'nodes': [n for n in nodes if n[0] < id]}, id, host, port))
-            sendobj(s, {'total-node-count': len(nodes), 'nodes': [n for n in nodes if n[0] < id]})
+            msg = {'total-node-count': len(nodes), 'nodes': [n for n in nodes if n[0] < id]}
+            print('Sending {} to {} ({}:{})'.format(msg, id, host, port))
+            sendobj(s, msg)
             s.close()
 
 if __name__ == '__main__':
