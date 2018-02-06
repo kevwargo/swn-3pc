@@ -6,7 +6,8 @@ from socklib import ObjectSocket
 from threading import Thread, Condition, RLock
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
-
+from random import randint as random
+from traceback import format_exc
 
 
 class Message:
@@ -16,6 +17,13 @@ class Message:
         self.len = None
         self.databuf = b''
         self.data = None
+
+    def __repr__(self):
+        if self.len is None:
+            return 'Message ({} of length)'.format(len(self.lenbuf))
+        if self.data is None:
+            return 'Message ({} of {} received)'.format(len(self.databuf), self.len)
+        return 'Message: {}'.format(self.data)
 
     def iscomplete(self):
         return self.data is not None
@@ -59,9 +67,10 @@ class MQueue:
         self._event_thread = Thread(target=self.event_loop)
         self._sel = Selector()
         self._msgbuf = []
-        self._nodes = {}
+        self._nodes = {id: self.local_node}
         self.size = None
         self._nodes_cond = Condition(self._lock)
+        self.timestamp = 0
 
     def log(self, msg, *args):
         with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(self.local_node.id)), 'a') as f:
@@ -75,15 +84,16 @@ class MQueue:
                     # self.log('Event in event_log: {}', key)
                     if 'handler' in key.data:
                         key.data['handler'](key.fileobj, key.data)
-                except (EOFError, OSError) as e:
-                    if not isinstance(e, EOFError):
-                        print(e, file=sys.stderr)
+                except EOFError:
+                    self._sel.unregister(key.fileobj)
+                except:
+                    self.log('Exception in event_loop (key: {}): {}', key, format_exc())
                     self._sel.unregister(key.fileobj)
 
-    def connect_handler(self, sock, data):
+    def on_connection(self, sock, data):
         c, a = self._sock.accept()
         self.log('New connection from {}', a)
-        self._sel.register(c, EVENT_READ, {'handler': self.raw_handler})
+        self._sel.register(c, EVENT_READ, {'handler': self.on_raw_data})
 
     def _extract_msg(self, sock, data):
         if not 'msg' in data:
@@ -95,7 +105,7 @@ class MQueue:
             msg.feed(sock)
         return msg
 
-    def raw_handler(self, sock, data):
+    def on_raw_data(self, sock, data):
         msg = self._extract_msg(sock, data)
         if msg.iscomplete():
             data = msg.getdata()
@@ -118,10 +128,10 @@ class MQueue:
                 with self._lock:
                     self._nodes[id] = Node(self, host, port, sock=sock, id=id)
                     self.log('New node (connection from {}): {} (total nodes: {} {})', sock.getpeername(), id, len(self._nodes), self._nodes)
-                    self._sel.modify(sock, EVENT_READ, {'handler': self.message_handler, 'node': self._nodes[id]})
+                    self._sel.modify(sock, EVENT_READ, {'handler': self.on_message, 'node': self._nodes[id]})
                     self._nodes_cond.notify_all()
 
-    def message_handler(self, sock, data):
+    def on_message(self, sock, data):
         try:
             msg = self._extract_msg(sock, data)
         except EOFError:
@@ -133,26 +143,32 @@ class MQueue:
             self.log('Node {} disconnected due to an error', data['node'])
             raise
         if msg.iscomplete():
-            with self._lock:
-                self.log('Message from {}: {}', data['node'].id, msg.getdata())
-                self._msgbuf.append({'node': data['node'], 'data': msg.getdata()})
-                self._msg_cond.notify_all()
+            msg = msg.getdata()
+            del data['msg']
+            if isinstance(msg, dict) and 'timestamp' in msg and 'data' in msg:
+                timestamp, msg = msg['timestamp'], msg['data']
+                with self._lock:
+                    self.timestamp = max(self.timestamp, timestamp) + 1
+                    self.log('Message from {}: {}. New timestamp: {}', data['node'].id, msg, self.timestamp)
+                    self._msgbuf.append({'node': data['node'], 'data': msg})
+                    self._msg_cond.notify_all()
 
     def register(self, node):
         with self._lock:
             self._nodes[node.id] = node
-            self._sel.register(node.sock, EVENT_READ, {'handler': self.message_handler, 'node': node})
+            self._sel.register(node.sock, EVENT_READ, {'handler': self.on_message, 'node': node})
             self.log('New node (connection to {} using {}): {} (total nodes: {} {})', node.sock.getpeername(), node.sock.getsockname(), node.id, len(self._nodes), self._nodes)
             self._nodes_cond.notify_all()
 
     def send(self, id, msg):
         if id != self.local_node.id:
             with self._lock:
-                self._nodes[id].sock.sendobj(msg)
+                self.timestamp += 1
+                self._nodes[id].sock.sendobj({'timestamp': self.timestamp, 'data': msg})
 
     def wait_for_init(self):
         with self._lock:
-            while self.size is None or len(self._nodes) < self.size - 1:
+            while self.size is None or len(self._nodes) < self.size:
                 self.log('In wait: self.size: {}, len(self._nodes): {}', self.size, len(self._nodes))
                 self._nodes_cond.wait()
 
@@ -161,8 +177,14 @@ class MQueue:
         self._sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self._sock.bind((self.local_node.host, self.local_node.port))
         self._sock.listen(5)
-        self._sel.register(self._sock, EVENT_READ, {'handler': self.connect_handler})
+        self._sel.register(self._sock, EVENT_READ, {'handler': self.on_connection})
         self._event_thread.start()
+
+    def loop(self):
+        try:
+            self.local_node.loop()
+        except:
+            self.mqueue.log('Exception in the main loop: {}', format_exc())
         
 
 class Node:
@@ -186,7 +208,10 @@ class Node:
 
     def loop(self):
         while True:
-            sleep(10)
+            sleep(random(3, 10))
+            id = random(1, self.mqueue.size)
+            self.mqueue.send(id, 'Random {} from {} to {}'.format(random(1, 1000000), self.id, id))
+
 
 
 
@@ -197,8 +222,8 @@ def main(id, host, port):
     print('LISTEN_OK', flush=True)
     mqueue.log('waiting for init...')
     mqueue.wait_for_init()
-    mqueue.log('initialized: {}', mqueue._nodes)
-    mqueue.local_node.loop()
+    mqueue.log('STARTING MAIN LOOP...')
+    mqueue.loop()
 
 
 if __name__ == '__main__':
