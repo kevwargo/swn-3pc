@@ -125,16 +125,16 @@ class MQueue:
         try:
             msg = self._extract_msg(sock, data)
         except EOFError:
-            # self.log('Node {} disconnected', data['node'])
+            self.log('Node {} disconnected', data['node'])
             with self._lock:
                 del self._nodes[data['node'].id]
             raise
         except OSError as ose:
-            # self.log('Node {} disconnected due to an error', data['node'])
+            self.log('Node {} disconnected due to an error', data['node'])
             raise
         if msg.iscomplete():
             with self._lock:
-                # self.log('Message from {}: {}', data['node'].id, msg.getdata())
+                self.log('Message from {}: {}', data['node'].id, msg.getdata())
                 self._msgbuf.append({'node': data['node'], 'data': msg.getdata()})
                 self._msg_cond.notify_all()
 
@@ -146,8 +146,9 @@ class MQueue:
             self._nodes_cond.notify_all()
 
     def send(self, id, msg):
-        with self._lock:
-            self._nodes[id].sock.sendobj(msg)
+        if id != self.local_node.id:
+            with self._lock:
+                self._nodes[id].sock.sendobj(msg)
 
     def wait_for_init(self):
         with self._lock:
