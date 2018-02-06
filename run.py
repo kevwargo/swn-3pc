@@ -6,6 +6,7 @@ from threading import Thread, Condition
 from socklib import ObjectSocket
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
+import re, readline
 
 
 class RemoteLauncher(Popen):
@@ -100,21 +101,32 @@ def main(procnum, hostnames):
             except:
                 pass
             raise
-        nodes = []
+        nodes = {}
         for host, info in hosts.items():
             for id, port in info.items():
-                nodes.append((id, host, port))
+                nodes[id] = {'host': host, 'port': port}
         print(nodes)
-        for id, host, port in nodes:
+        for id, node in nodes.items():
+            host, port = node['host'], node['port']
             s = ObjectSocket()
             try:
                 s.connect((host, port))
             except ConnectionError as ce:
                 print(ce, (host, port))
-            msg = {'total-node-count': len(nodes), 'nodes': [n for n in nodes if n[0] < id]}
+            msg = {'total-node-count': len(nodes), 'nodes': [(i, n['host'], n['port']) for i, n in nodes.items() if i < id]}
             print('Sending {} to {} ({}:{})'.format(msg, id, host, port))
             s.sendobj(msg)
-            s.close()
+            node['sock'] = s
+        command_loop(nodes)
+
+def command_loop(nodes):
+    regex = re.compile('^([0-9]+)\s+(.*)')
+    while True:
+        string = input('-> ')
+        m = regex.match(string)
+        if m:
+            nodes[int(m.group(1))]['sock'].sendobj(m.group(2))
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:

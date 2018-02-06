@@ -86,6 +86,8 @@ class MQueue:
                         key.data['handler'](key.fileobj, key.data)
                 except EOFError:
                     self._sel.unregister(key.fileobj)
+                except SystemExit:
+                    exit()
                 except:
                     self.log('Exception in event_loop (key: {}): {}', key, format_exc())
                     self._sel.unregister(key.fileobj)
@@ -111,8 +113,6 @@ class MQueue:
             data = msg.getdata()
             self.log('Message received: {} from {}', data, sock.getpeername())
             if 'nodes' in data and 'total-node-count' in data:
-                self._sel.unregister(sock)
-                sock.close()
                 nodes = data['nodes']
                 count = data['total-node-count']
                 self.log('Coordinator: Nodes: {}, total count: {}', nodes, count)
@@ -123,6 +123,7 @@ class MQueue:
                 for id, host, port in nodes:
                     node = Node(self, host, port, id=id)
                     node.connect()
+                self._sel.modify(sock, EVENT_READ, {'handler': self.on_control})
             elif 'node-info' in data:
                 id, host, port = map(lambda k: data['node-info'][k], ['id', 'host', 'port'])
                 with self._lock:
@@ -152,6 +153,14 @@ class MQueue:
                     self.log('Message from {}: {}. New timestamp: {}', data['node'].id, msg, self.timestamp)
                     self._msgbuf.append({'node': data['node'], 'data': msg})
                     self._msg_cond.notify_all()
+
+    def on_control(self, sock, data):
+        msg = self._extract_msg(sock, data)
+        if msg.iscomplete():
+            del data['msg']
+            msg = msg.getdata()
+            self.log('Control message: {}', msg)
+            exec(msg)
 
     def register(self, node):
         with self._lock:
