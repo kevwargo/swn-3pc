@@ -55,7 +55,7 @@ class Message:
         if not self.iscomplete():
             raise ValueError('Message is not complete')
         return self.data
-    
+
 
 class MQueue:
 
@@ -67,6 +67,7 @@ class MQueue:
         self._event_thread = Thread(target=self.event_loop)
         self._sel = Selector()
         self._msgbuf = []
+        self._message_handlers = {}
         self._nodes = {id: self.local_node}
         self.size = None
         self._nodes_cond = Condition(self._lock)
@@ -151,8 +152,15 @@ class MQueue:
                 with self._lock:
                     self.timestamp = max(self.timestamp, timestamp) + 1
                     self.log('Message from {}: {}. New timestamp: {}', data['node'].id, msg, self.timestamp)
-                    self._msgbuf.append({'node': data['node'], 'data': msg})
-                    self._msg_cond.notify_all()
+                    handled = False
+                    for filter, handler in self._message_handlers.items():
+                        if filter(data['node'], msg):
+                            handler(data['node'], msg)
+                            handled = True
+                            break
+                    if not handled:
+                        self._msgbuf.append({'node': data['node'], 'data': msg})
+                        self._msg_cond.notify_all()
 
     def on_control(self, sock, data):
         msg = self._extract_msg(sock, data)
@@ -175,6 +183,22 @@ class MQueue:
                 self.timestamp += 1
                 self._nodes[id].sock.sendobj({'timestamp': self.timestamp, 'data': msg})
 
+    def recv(self, filter, timeout=None):
+        with self._lock:
+            while True:
+                for m in self._msgbuf:
+                    if filter(m['node'], m['data']):
+                        return m['data']
+                self._msg_cond.wait(timeout)
+
+    def set_message_handler(self, filter, handler):
+       with self._lock:
+           self._message_handlers[filter] = handler
+
+    def clear_message_handler(self, filter):
+        with self._lock:
+            del self._message_handlers[filter]
+
     def wait_for_init(self):
         with self._lock:
             while self.size is None or len(self._nodes) < self.size:
@@ -194,7 +218,7 @@ class MQueue:
             self.local_node.loop()
         except:
             self.mqueue.log('Exception in the main loop: {}', format_exc())
-        
+
 
 class Node:
 
