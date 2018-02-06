@@ -1,12 +1,12 @@
 import sys, fcntl, os
-from time import sleep, asctime
+from time import sleep, monotonic as monotonic_time
 from selectors import DefaultSelector as Selector, EVENT_READ
 from socket import SOL_SOCKET, SO_REUSEADDR
 from socklib import ObjectSocket
 from threading import Thread, Condition, RLock
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
-from random import randint as random
+import random
 from traceback import format_exc
 
 
@@ -188,8 +188,15 @@ class MQueue:
             while True:
                 for m in self._msgbuf:
                     if filter(m['node'], m['data']):
-                        return m['data']
-                self._msg_cond.wait(timeout)
+                        return m['node'], m['data']
+                if timeout is not None:
+                    t = monotonic_time()
+                if not self._msg_cond.wait(timeout):
+                    raise TimeoutError
+                if timeout is not None:
+                    timeout -= monotonic_time() - t
+                    if timeout <= 0:
+                        raise TimeoutError
 
     def set_message_handler(self, filter, handler):
        with self._lock:
@@ -197,7 +204,8 @@ class MQueue:
 
     def clear_message_handler(self, filter):
         with self._lock:
-            del self._message_handlers[filter]
+            if filter in self._message_handlers:
+                del self._message_handlers[filter]
 
     def wait_for_init(self):
         with self._lock:
@@ -228,6 +236,7 @@ class Node:
         self.port = port
         self.id = id
         self.sock = sock
+        self.is_coord = False
 
     def __repr__(self):
         return 'Node [{}] at {}:{}'.format(self.id, self.host, self.port)
@@ -239,12 +248,64 @@ class Node:
         self.sock.sendobj({'node-info': {a: getattr(self.mqueue.local_node, a) for a in ['id', 'host', 'port']}})
         self.mqueue.register(self)
 
+    def recv_agreed(self):
+        def flt(n, msg):
+            if isinstance(msg, dict) and 'type' in msg and msg['type'] == 'agreed':
+                return True
+            return False
+        return self.mqueue.recv(flt, 10)[0]
+
+    def state_qi(self):
+        try:
+            coord = self.mqueue.recv(lambda n, m: (isinstance(m, dict) and 'type' in m and m['type'] == 'request'), 3)[0]
+        except:
+            self.mqueue.log('Exception in QUERY: {}', format_exc())
+            return self.state_ai()
+        self.mqueue.log('Received Commit Request from {}', coord)
+        return self.state_wi(coord)
+
+    def state_wi(self, coord):
+        try:
+            msg = self.mqueue.recv(lambda n, m: (n.id == coord.id and isinstance(m, dict) and 'type' in m and m['type'] in ('prepare', 'abort')), 10)
+        except:
+            self.mqueue.log('Exception in state_wi during recv: {}', format_exc())
+            return self.state_ai()
+        if msg['type'] == 'prepare':
+            try:
+                self.mqueue.send(coord.id, {'type': 'ack'})
+            except:
+                self.mqueue.log('Exception in state_wi during send ACK: {}', format_exc())
+                return self.state_ai()
+            return self.state_pi(coord)
+        else:
+            self.mqueue.log('Received ABORT from coord in state_wi')
+            return self.state_ai()
+
+    def state_pi(self, coord):
+        try:
+            msg = self.mqueue.recv(lambda n, m: (n.id == coord.id and isinstance(m, dict) and 'type' in m and m['type'] in ('commit', 'abort')), 10)
+        except:
+            self.mqueue.log('Exception in state_pi during recv: {}', format_exc())
+            return self.state_ci()
+        if msg['type'] == 'abort':
+            self.mqueue.log('Received ABORT from coord in state_pi')
+            return self.state_ai()
+        return self.state_ci()
+
+    def state_ai(self):
+        self.mqueue.log('Entered ABORTED state')
+        return False
+
+    def state_ci(self):
+        self.mqueue.log('Entered COMMITTED state')
+        return True
+
     def loop(self):
         while True:
-            sleep(random(3, 10))
-            id = random(1, self.mqueue.size)
-            self.mqueue.send(id, 'Random {} from {} to {}'.format(random(1, 1000000), self.id, id))
-
+            self.state_qi()
+            if self.is_coord:
+                self.mqueue.log('Node {} act as COORD', self)
+                self.state_q1()
 
 
 
