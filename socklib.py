@@ -5,7 +5,7 @@ from socket import socket
 __all__ = ['ObjectSocket']
 
 
-class ObjectSocket:
+class ObjectSocket(socket):
 
     def __init__(self, _sock=None):
         if _sock is not None:
