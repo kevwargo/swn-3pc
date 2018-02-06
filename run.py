@@ -3,10 +3,9 @@
 import sys, random, os
 from subprocess import Popen, PIPE, call
 from threading import Thread, Condition
-from socket import socket
+from socklib import ObjectSocket
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
-from socklib import sendobj
 
 
 class RemoteLauncher(Popen):
@@ -107,14 +106,14 @@ def main(procnum, hostnames):
                 nodes.append((id, host, port))
         print(nodes)
         for id, host, port in nodes:
-            s = socket()
+            s = ObjectSocket()
             try:
                 s.connect((host, port))
             except ConnectionError as ce:
                 print(ce, (host, port))
             msg = {'total-node-count': len(nodes), 'nodes': [n for n in nodes if n[0] < id]}
             print('Sending {} to {} ({}:{})'.format(msg, id, host, port))
-            sendobj(s, msg)
+            s.sendobj(msg)
             s.close()
 
 if __name__ == '__main__':

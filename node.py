@@ -1,11 +1,11 @@
 import sys, fcntl, os
 from time import sleep, asctime
 from selectors import DefaultSelector as Selector, EVENT_READ
-from socket import socket, SOL_SOCKET, SO_REUSEADDR
+from socket import SOL_SOCKET, SO_REUSEADDR
+from socklib import ObjectSocket
 from threading import Thread, Condition, RLock
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
-from socklib import sendobj
 
 
 
@@ -53,7 +53,7 @@ class MQueue:
 
     def __init__(self, id, host, port):
         self.local_node = Node(self, host, port, id=id)
-        self._sock = socket()
+        self._sock = ObjectSocket()
         self._lock = RLock()
         self._msg_cond = Condition(self._lock)
         self._event_thread = Thread(target=self.event_loop)
@@ -147,7 +147,7 @@ class MQueue:
 
     def send(self, id, msg):
         with self._lock:
-            sendobj(self._nodes[id].sock, msg)
+            self._nodes[id].sock.sendobj(msg)
 
     def wait_for_init(self):
         with self._lock:
@@ -177,10 +177,10 @@ class Node:
         return 'Node [{}] at {}:{}'.format(self.id, self.host, self.port)
 
     def connect(self):
-        self.sock = socket()
+        self.sock = ObjectSocket()
         self.sock.connect((self.host, self.port))
         self.mqueue.log('Connected to {} ({}:{}) using {}', self.id, self.host, self.port, self.sock.getsockname())
-        sendobj(self.sock, {'node-info': {a: getattr(self.mqueue.local_node, a) for a in ['id', 'host', 'port']}})
+        self.sock.sendobj({'node-info': {a: getattr(self.mqueue.local_node, a) for a in ['id', 'host', 'port']}})
         self.mqueue.register(self)
 
     def loop(self):
