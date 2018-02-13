@@ -177,6 +177,17 @@ class MQueue:
                     self.timestamp = max(self.timestamp, msg['timestamp']) + 1
                     self.log('Message from {}: {} (ts {}). New timestamp: {}', data['node'].id, msg, msg['timestamp'], self.timestamp)
                     msg['node'] = data['node']
+                    if self.controller:
+                        try:
+                            self.controller.sendobj({
+                                'timestamp': msg['timestamp'],
+                                'from': msg['node'].id,
+                                'to': self.local_node.id,
+                                'data': msg['data'],
+                                'in-channel': True
+                            })
+                        except:
+                            self.log('Exception while sending message {} to controller: {}', m, format_exc())
                     for filter, handler in self._message_handlers.items():
                         if filter(msg):
                             handler(msg)
@@ -233,7 +244,8 @@ class MQueue:
                                     'timestamp': m['timestamp'],
                                     'from': m['node'].id,
                                     'to': self.local_node.id,
-                                    'data': m['data']
+                                    'data': m['data'],
+                                    'in-channel': False
                                     })
                             except:
                                 self.log('Exception while sending message {} to controller: {}', m, format_exc())
@@ -354,6 +366,8 @@ class Node(metaclass=NodeClass):
         self.request_response = MSG_AGREE
         self.abort_timestamp = 0
         self.request_timestamp = 0
+        self.send_ack = True
+        self.send_commit = True
 
     def __repr__(self):
         return 'Node [{}] at {}:{}'.format(self.id, self.host, self.port)
@@ -409,12 +423,13 @@ class Node(metaclass=NodeClass):
     def state_cohort_wait(self, coord):
         msg = self.mqueue.recv(self.msg_filter((MSG_PREPARE, MSG_ABORT), node=coord, timestamp=self.request_timestamp), 10)['data']
         if msg['type'] == MSG_PREPARE:
-            try:
-                coord.send({'type': MSG_ACK})
-            except OSError:
-                self.mqueue.log('Exception in COHORT WAIT during ACK send: {}', format_exc())
-                return self.state_cohort_abort()
-            return self.state_cohort_prepared(coord)
+            if self.send_ack:
+                try:
+                    coord.send({'type': MSG_ACK})
+                except OSError:
+                    self.mqueue.log('Exception in COHORT WAIT during ACK send: {}', format_exc())
+                    return self.state_cohort_abort()
+                return self.state_cohort_prepared(coord)
         else:
             self.mqueue.log('Received ABORT from Coordinator in COHORT WAIT')
             return self.state_cohort_abort()
@@ -469,12 +484,13 @@ class Node(metaclass=NodeClass):
             n = msg['node']
             self.mqueue.log('Received {} ACK from {}', ('new' if acks.add(n.id) else 'repeated'), n)
         for n in self.mqueue.nodes.values():
-            try:
-                n.send({'type': MSG_COMMIT})
-            except KeyboardInterrupt:
-                raise
-            except:
-                pass
+            if self.send_commit:
+                try:
+                    n.send({'type': MSG_COMMIT})
+                except KeyboardInterrupt:
+                    raise
+                except:
+                    pass
         return self.state_coord_commit()
 
     def state_coord_abort(self):

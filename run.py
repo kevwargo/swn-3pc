@@ -142,7 +142,7 @@ class MessageLog:
     def show(self):
         # print('len ' + str(len(self.log)))
         for i in sorted(self.log, key=lambda l: l['timestamp']):
-            print('{} -> {}: {} ({})'.format(i['from'], i['to'], i['data'], i['timestamp']))
+            print('{} -> {}: {} ({})'.format(i['from'], i['to'], i['data'], i['timestamp'], 'in-channel' if i['in-channel'] else 'delivered'))
                 
     
 def command_loop(nodes):
