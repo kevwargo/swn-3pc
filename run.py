@@ -8,7 +8,8 @@ from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
 from traceback import format_exc
 import re, readline
-
+from selectors import DefaultSelector as Selector, EVENT_READ
+from node import Message
 
 class RemoteLauncher(Popen):
 
@@ -106,8 +107,47 @@ def init_nodes(hosts):
         s.sendobj(msg)
         node['sock'] = s
     return nodes
+
+
+class MessageLog:
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.log = []
+
+    def start(self):
+        _sel = Selector()
+        for n in self.nodes.values():
+            _sel.register(n['sock'], EVENT_READ, {})
+        Thread(target=self._loop, args=(_sel,), daemon=True).start()
+
+    def _loop(self, sel):
+        while True:
+            for key, events in sel.select():
+                if not 'msg' in key.data:
+                    msg = Message()
+                    key.data['msg'] = msg
+                else:
+                    msg = key.data['msg']
+                if not msg.iscomplete():
+                    msg.feed(key.fileobj)
+                # print('msg')
+                if msg.iscomplete():
+                    # print('msg complete')
+                    del key.data['msg']
+                    msg = msg.getdata()
+                    if isinstance(msg, dict) and 'timestamp' in msg:
+                        self.log.append(msg)
+
+    def show(self):
+        # print('len ' + str(len(self.log)))
+        for i in sorted(self.log, key=lambda l: l['timestamp']):
+            print('{} -> {}: {} ({})'.format(i['from'], i['to'], i['data'], i['timestamp']))
+                
     
 def command_loop(nodes):
+    msglog = MessageLog(nodes)
+    msglog.start()
     regex = re.compile('^([0-9]+)\s+(.*)')
     while True:
         try:
@@ -119,6 +159,8 @@ def command_loop(nodes):
         m = regex.match(string)
         if m:
             nodes[int(m.group(1))]['sock'].sendobj(m.group(2))
+        elif string.strip() == 'msglog':
+            msglog.show()
 
 def main(procnum, hostnames):
     hosts = {}

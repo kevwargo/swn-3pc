@@ -85,6 +85,7 @@ class MQueue:
         self.size = None
         self.timestamp = 0
         self.running = True
+        self.controller = None
 
     def log(self, msg, *args):
         # with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(self.local_node.id)), 'a') as f:
@@ -148,6 +149,7 @@ class MQueue:
                     node = Node(self, host, port, id=id)
                     node.connect()
                 self._sel.modify(sock, EVENT_READ, {'handler': self.on_control})
+                self.controller = sock
             elif 'node-info' in data:
                 id, host, port = map(lambda k: data['node-info'][k], ['id', 'host', 'port'])
                 with self._lock:
@@ -225,6 +227,16 @@ class MQueue:
                 for m in self._msgbuf:
                     if filter(m):
                         self._msgbuf.remove(m)
+                        if self.controller:
+                            try:
+                                self.controller.sendobj({
+                                    'timestamp': m['timestamp'],
+                                    'from': m['node'].id,
+                                    'to': self.local_node.id,
+                                    'data': m['data']
+                                    })
+                            except:
+                                self.log('Exception while sending message {} to controller: {}', m, format_exc())
                         return m
                 if timeout is not None:
                     t = _time()
