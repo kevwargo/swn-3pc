@@ -5,6 +5,7 @@ from subprocess import Popen, PIPE
 from pickle import dumps as pickle, loads as unpickle
 
 def log(msg):
+    return
     with open(os.path.join(os.path.dirname(sys.argv[0]), 'launch-{}.log'.format('-'.join(sys.argv[1:]))), 'a') as f:
         print(msg, file=f, flush=True)
 

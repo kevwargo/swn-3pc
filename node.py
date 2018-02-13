@@ -1,14 +1,26 @@
 import sys, fcntl, os
-from time import sleep, monotonic as monotonic_time
+import time
+try:
+    from time import monotonic as _time
+except ImportError:
+    from time import time as _time
 from selectors import DefaultSelector as Selector, EVENT_READ
 from socket import SOL_SOCKET, SO_REUSEADDR
 from socklib import ObjectSocket
 from threading import Thread, Condition, RLock
+import _thread
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
 import random
 from traceback import format_exc
 
+
+MSG_REQUEST = 'request'
+MSG_AGREE   = 'agree'
+MSG_ABORT   = 'abort'
+MSG_PREPARE = 'prepare'
+MSG_COMMIT  = 'commit'
+MSG_ACK     = 'ack'
 
 class Message:
 
@@ -64,18 +76,26 @@ class MQueue:
         self._sock = ObjectSocket()
         self._lock = RLock()
         self._msg_cond = Condition(self._lock)
-        self._event_thread = Thread(target=self.event_loop)
+        self._nodes_cond = Condition(self._lock)
+        self._event_thread = Thread(target=self.event_loop, daemon=True)
         self._sel = Selector()
         self._msgbuf = []
         self._message_handlers = {}
-        self._nodes = {id: self.local_node}
+        self.nodes = {id: self.local_node}
         self.size = None
-        self._nodes_cond = Condition(self._lock)
         self.timestamp = 0
+        self.running = True
 
     def log(self, msg, *args):
-        with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(self.local_node.id)), 'a') as f:
-            print('{}({}): {}'.format(self.local_node.id, os.getpid(), msg.format(*args)), file=f, flush=True)
+        # with open(os.path.join(os.path.dirname(sys.argv[0]), 'output-{}.log'.format(self.local_node.id)), 'a') as f:
+        with open(os.path.join(os.path.dirname(sys.argv[0]), 'debug.log'), 'a') as f:
+            t = time.time()
+            date = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t)) + '{:.3f}'.format(t - int(t))[1:]
+            if isinstance(msg, str):
+                msg = msg.format(*args)
+            else:
+                msg = str(msg)
+            print('{} [{}]: {}'.format(date, self.local_node.id, msg), file=f, flush=True)
 
     def event_loop(self):
         while True:
@@ -88,7 +108,10 @@ class MQueue:
                 except EOFError:
                     self._sel.unregister(key.fileobj)
                 except SystemExit:
-                    exit()
+                    self.log('EXITING')
+                    with self._lock:
+                        self.running = False
+                        self._msg_cond.notify_all()
                 except:
                     self.log('Exception in event_loop (key: {}): {}', key, format_exc())
                     self._sel.unregister(key.fileobj)
@@ -116,7 +139,7 @@ class MQueue:
             if 'nodes' in data and 'total-node-count' in data:
                 nodes = data['nodes']
                 count = data['total-node-count']
-                self.log('Coordinator: Nodes: {}, total count: {}', nodes, count)
+                self.log('Controller: Nodes: {}, total count: {}', nodes, count)
                 with self._lock:
                     self.size = count
                     self.log('Setting self.size = {}', self.size)
@@ -128,9 +151,9 @@ class MQueue:
             elif 'node-info' in data:
                 id, host, port = map(lambda k: data['node-info'][k], ['id', 'host', 'port'])
                 with self._lock:
-                    self._nodes[id] = Node(self, host, port, sock=sock, id=id)
-                    self.log('New node (connection from {}): {} (total nodes: {} {})', sock.getpeername(), id, len(self._nodes), self._nodes)
-                    self._sel.modify(sock, EVENT_READ, {'handler': self.on_message, 'node': self._nodes[id]})
+                    self.nodes[id] = Node(self, host, port, sock=sock, id=id)
+                    self.log('New node (connection from {}): {} (total nodes: {} {})', sock.getpeername(), id, len(self.nodes), self.nodes)
+                    self._sel.modify(sock, EVENT_READ, {'handler': self.on_message, 'node': self.nodes[id]})
                     self._nodes_cond.notify_all()
 
     def on_message(self, sock, data):
@@ -139,7 +162,7 @@ class MQueue:
         except EOFError:
             self.log('Node {} disconnected', data['node'])
             with self._lock:
-                del self._nodes[data['node'].id]
+                del self.nodes[data['node'].id]
             raise
         except OSError as ose:
             self.log('Node {} disconnected due to an error', data['node'])
@@ -148,19 +171,16 @@ class MQueue:
             msg = msg.getdata()
             del data['msg']
             if isinstance(msg, dict) and 'timestamp' in msg and 'data' in msg:
-                timestamp, msg = msg['timestamp'], msg['data']
                 with self._lock:
-                    self.timestamp = max(self.timestamp, timestamp) + 1
-                    self.log('Message from {}: {}. New timestamp: {}', data['node'].id, msg, self.timestamp)
-                    handled = False
+                    self.timestamp = max(self.timestamp, msg['timestamp']) + 1
+                    self.log('Message from {}: {} (ts {}). New timestamp: {}', data['node'].id, msg, msg['timestamp'], self.timestamp)
+                    msg['node'] = data['node']
                     for filter, handler in self._message_handlers.items():
-                        if filter(data['node'], msg):
-                            handler(data['node'], msg)
-                            handled = True
-                            break
-                    if not handled:
-                        self._msgbuf.append({'node': data['node'], 'data': msg})
-                        self._msg_cond.notify_all()
+                        if filter(msg):
+                            handler(msg)
+                            return
+                    self._msgbuf.append(msg)
+                    self._msg_cond.notify_all()
 
     def on_control(self, sock, data):
         msg = self._extract_msg(sock, data)
@@ -168,35 +188,58 @@ class MQueue:
             del data['msg']
             msg = msg.getdata()
             self.log('Control message: {}', msg)
-            exec(msg)
+            try:
+                exec(msg)
+            except SystemExit:
+                raise
+            except:
+                pass
 
     def register(self, node):
         with self._lock:
-            self._nodes[node.id] = node
+            self.nodes[node.id] = node
             self._sel.register(node.sock, EVENT_READ, {'handler': self.on_message, 'node': node})
-            self.log('New node (connection to {} using {}): {} (total nodes: {} {})', node.sock.getpeername(), node.sock.getsockname(), node.id, len(self._nodes), self._nodes)
+            self.log('New node (connection to {} using {}): {} (total nodes: {} {})', node.sock.getpeername(), node.sock.getsockname(), node.id, len(self.nodes), self.nodes)
             self._nodes_cond.notify_all()
 
     def send(self, id, msg):
+        assert isinstance(msg, dict), 'Message should be dict'
         if id != self.local_node.id:
             with self._lock:
                 self.timestamp += 1
-                self._nodes[id].sock.sendobj({'timestamp': self.timestamp, 'data': msg})
+                self.nodes[id].sock.sendobj({'timestamp': self.timestamp, 'data': msg})
+
+    def broadcast(self, msg):
+        with self._lock:
+            self.timestamp += 1
+            for n in self.nodes.values():
+                if n.id != self.local_node.id:
+                    n.sock.sendobj({'timestamp': self.timestamp, 'data': msg})
 
     def recv(self, filter, timeout=None):
         with self._lock:
             while True:
+                if not self.running:
+                    self.log('MAIN THREAD TERMINATING')
+                    exit()
                 for m in self._msgbuf:
-                    if filter(m['node'], m['data']):
-                        return m['node'], m['data']
+                    if filter(m):
+                        self._msgbuf.remove(m)
+                        return m
                 if timeout is not None:
-                    t = monotonic_time()
+                    t = _time()
                 if not self._msg_cond.wait(timeout):
                     raise TimeoutError
                 if timeout is not None:
-                    timeout -= monotonic_time() - t
+                    timeout -= _time() - t
                     if timeout <= 0:
                         raise TimeoutError
+
+    def become_coord(self):
+        with self._lock:
+            self.timestamp += 1
+            self._msgbuf.insert(0, {'node': self.local_node, 'data': {'type': MSG_REQUEST, 'change-state': 'coord'}})
+            self._msg_cond.notify_all()
 
     def set_message_handler(self, filter, handler):
        with self._lock:
@@ -209,8 +252,8 @@ class MQueue:
 
     def wait_for_init(self):
         with self._lock:
-            while self.size is None or len(self._nodes) < self.size:
-                self.log('In wait: self.size: {}, len(self._nodes): {}', self.size, len(self._nodes))
+            while self.size is None or len(self.nodes) < self.size:
+                self.log('In wait: self.size: {}, len(self.nodes): {}', self.size, len(self.nodes))
                 self._nodes_cond.wait()
 
     def start(self):
@@ -227,8 +270,67 @@ class MQueue:
         except:
             self.mqueue.log('Exception in the main loop: {}', format_exc())
 
+class SSet(set):
 
-class Node:
+    def add(self, item):
+        oldlen = len(self)
+        set.add(self, item)
+        return oldlen < len(self)
+
+class NodeClass(type):
+
+    stateExceptions = {
+        'cohort_init': 'cohort_abort',
+        'cohort_wait': 'cohort_abort',
+        'cohort_prepared': 'cohort_commit',
+        'coord_init': 'coord_abort',
+        'coord_wait': 'coord_abort',
+        'coord_prepared': {
+            'timeout': 'coord_abort',
+            'fail': 'coord_commit'
+        }
+    }
+
+    @classmethod
+    def _wrap(cls, state, method):
+        def _wrapper(self, *args):
+            stateRepr = state.replace('_', ' ').upper()
+            self.mqueue.log('Entering state {}', stateRepr)
+            timeout_handler = None
+            fail_handler = None
+            if state in cls.stateExceptions:
+                try:
+                    if isinstance(cls.stateExceptions[state], dict):
+                        timeout_handler = getattr(self, 'state_' + cls.stateExceptions[state]['timeout'])
+                        assert callable(timeout_handler), 'Timeout handler {} for {} is not callable'.format(timeout_handler, stateRepr)
+                        fail_handler = getattr(self, 'state_' + cls.stateExceptions[state]['fail'])
+                    else:
+                        fail_handler = getattr(self, 'state_' + cls.stateExceptions[state])
+                    assert callable(fail_handler), 'Failure handler {} for {} is not callable'.format(fail_handler, stateRepr)
+                except:
+                    self.mqueue.log('Exception while looking for error handlers: {}', format_exc())
+            try:
+                return method(self, *args)
+            except SystemExit:
+                for n in self.mqueue.nodes.values():
+                    n.sock.close()
+                raise
+            except BaseException as e:
+                self.mqueue.log('Exception in state {}: {}', stateRepr, format_exc())
+                if isinstance(e, TimeoutError) and callable(timeout_handler):
+                    timeout_handler()
+                elif callable(fail_handler):
+                    fail_handler()
+        return _wrapper
+
+    def __new__(cls, name, bases, dict):
+        for k, v in dict.items():
+            if k.startswith('state_') and isinstance(v, type(lambda: None)):
+                dict[k] = cls._wrap(k[6:], v)
+        return type.__new__(cls, name, bases, dict)
+
+
+class Node(metaclass=NodeClass):
 
     def __init__(self, mqueue, host, port, *, id=None, sock=None):
         self.mqueue = mqueue
@@ -237,6 +339,9 @@ class Node:
         self.id = id
         self.sock = sock
         self.is_coord = False
+        self.request_response = MSG_AGREE
+        self.abort_timestamp = 0
+        self.request_timestamp = 0
 
     def __repr__(self):
         return 'Node [{}] at {}:{}'.format(self.id, self.host, self.port)
@@ -248,64 +353,129 @@ class Node:
         self.sock.sendobj({'node-info': {a: getattr(self.mqueue.local_node, a) for a in ['id', 'host', 'port']}})
         self.mqueue.register(self)
 
-    def recv_agreed(self):
-        def flt(n, msg):
-            if isinstance(msg, dict) and 'type' in msg and msg['type'] == 'agreed':
-                return True
-            return False
-        return self.mqueue.recv(flt, 10)[0]
+    def send(self, msg):
+        self.mqueue.send(self.id, msg)
 
-    def state_qi(self):
-        try:
-            coord = self.mqueue.recv(lambda n, m: (isinstance(m, dict) and 'type' in m and m['type'] == 'request'), 3)[0]
-        except:
-            self.mqueue.log('Exception in QUERY: {}', format_exc())
-            return self.state_ai()
-        self.mqueue.log('Received Commit Request from {}', coord)
-        return self.state_wi(coord)
+    def msg_filter(self, type, node=None, timestamp=None):
+        def flt(m):
+            if not (isinstance(m['data'], dict) and 'type' in m['data']):
+                return False
+            if isinstance(type, (tuple, list)):
+                if not m['data']['type'] in type:
+                    return False
+            else:
+                if m['data']['type'] != type:
+                    return False
+            if node and m['node'].id != node.id:
+                return False
+            if timestamp is not None and m['timestamp'] <= timestamp:
+                return False
+            return True
+        return flt
 
-    def state_wi(self, coord):
-        try:
-            msg = self.mqueue.recv(lambda n, m: (n.id == coord.id and isinstance(m, dict) and 'type' in m and m['type'] in ('prepare', 'abort')), 10)
-        except:
-            self.mqueue.log('Exception in state_wi during recv: {}', format_exc())
-            return self.state_ai()
-        if msg['type'] == 'prepare':
-            try:
-                self.mqueue.send(coord.id, {'type': 'ack'})
-            except:
-                self.mqueue.log('Exception in state_wi during send ACK: {}', format_exc())
-                return self.state_ai()
-            return self.state_pi(coord)
+    def state_cohort_init(self):
+        msg = self.mqueue.recv(self.msg_filter(MSG_REQUEST))
+        if 'change-state' in msg['data'] and msg['data']['change-state'] == 'coord':
+            self.mqueue.log('{} became Coordinator', self)
+            return self.state_coord_init()
+        self.request_timestamp = msg['timestamp']
+        coord = msg['node']
+        if self.request_response == MSG_AGREE:
+            text = 'agreeing'
+        elif self.request_response == MSG_ABORT:
+            text = 'aborting'
         else:
-            self.mqueue.log('Received ABORT from coord in state_wi')
-            return self.state_ai()
+            text = 'replying nothing, simulating timeout'
+        self.mqueue.log('Received Commit Request from {}, {}', coord, text)
+        if self.request_response == MSG_AGREE:
+            coord.send({'type': MSG_AGREE})
+            return self.state_cohort_wait(coord)
+        elif self.request_response == MSG_ABORT:
+            coord.send({'type': MSG_ABORT})
+            return self.state_cohort_abort()
 
-    def state_pi(self, coord):
-        try:
-            msg = self.mqueue.recv(lambda n, m: (n.id == coord.id and isinstance(m, dict) and 'type' in m and m['type'] in ('commit', 'abort')), 10)
-        except:
-            self.mqueue.log('Exception in state_pi during recv: {}', format_exc())
-            return self.state_ci()
-        if msg['type'] == 'abort':
-            self.mqueue.log('Received ABORT from coord in state_pi')
-            return self.state_ai()
-        return self.state_ci()
+    def state_cohort_wait(self, coord):
+        msg = self.mqueue.recv(self.msg_filter((MSG_PREPARE, MSG_ABORT), node=coord, timestamp=self.request_timestamp), 10)['data']
+        if msg['type'] == MSG_PREPARE:
+            try:
+                coord.send({'type': MSG_ACK})
+            except OSError:
+                self.mqueue.log('Exception in COHORT WAIT during ACK send: {}', format_exc())
+                return self.state_cohort_abort()
+            return self.state_cohort_prepared(coord)
+        else:
+            self.mqueue.log('Received ABORT from Coordinator in COHORT WAIT')
+            return self.state_cohort_abort()
 
-    def state_ai(self):
-        self.mqueue.log('Entered ABORTED state')
+    def state_cohort_prepared(self, coord):
+        msg = self.mqueue.recv(self.msg_filter((MSG_COMMIT, MSG_ABORT), coord), 10)['data']
+        if msg['type'] == MSG_ABORT:
+            self.mqueue.log('Received ABORT from Coordinator in COHORT PREPARED')
+            return self.state_cohort_abort()
+        return self.state_cohort_commit()
+
+    def state_cohort_abort(self):
         return False
 
-    def state_ci(self):
-        self.mqueue.log('Entered COMMITTED state')
+    def state_cohort_commit(self):
+        return True
+
+
+    def _bcast_abort(self):
+        self.mqueue.log('{} broadcasting ABORT', self)
+        try:
+            self.mqueue.broadcast({'type': MSG_ABORT})
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+
+    def state_coord_init(self):
+        self.mqueue.log('{} broadcasting REQUEST', self)
+        self.mqueue.broadcast({'type': MSG_REQUEST})
+        self.state_coord_wait()
+
+    def state_coord_wait(self):
+        agrees = SSet()
+        while len(agrees) < len(self.mqueue.nodes) - 1:
+            msg = self.mqueue.recv(self.msg_filter((MSG_AGREE, MSG_ABORT), timestamp=self.abort_timestamp), 10)
+            n = msg['node']
+            if msg['data']['type'] == MSG_AGREE:
+                self.mqueue.log('Received {} AGREE from {}', ('new' if agrees.add(n.id) else 'repeated'), n)
+            else:
+                self.mqueue.log('Received ABORT from {}', n)
+                return self.state_coord_abort()
+        self.mqueue.log('Received AGREEs: {} (n={})', agrees, len(agrees))
+        for n in self.mqueue.nodes.values():
+            n.send({'type': MSG_PREPARE})
+        return self.state_coord_prepared()
+
+    def state_coord_prepared(self):
+        acks = SSet()
+        while len(acks) < len(self.mqueue.nodes) - 1:
+            msg = self.mqueue.recv(self.msg_filter(MSG_ACK), 10)
+            n = msg['node']
+            self.mqueue.log('Received {} ACK from {}', ('new' if acks.add(n.id) else 'repeated'), n)
+        for n in self.mqueue.nodes.values():
+            try:
+                n.send({'type': MSG_COMMIT})
+            except KeyboardInterrupt:
+                raise
+            except:
+                pass
+        return self.state_coord_commit()
+
+    def state_coord_abort(self):
+        self._bcast_abort()
+        self.abort_timestamp = self.mqueue.timestamp
+        return False
+
+    def state_coord_commit(self):
         return True
 
     def loop(self):
         while True:
-            self.state_qi()
-            if self.is_coord:
-                self.mqueue.log('Node {} act as COORD', self)
-                self.state_q1()
+            self.state_cohort_init()
 
 
 

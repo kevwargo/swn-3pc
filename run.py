@@ -6,6 +6,7 @@ from threading import Thread, Condition
 from socklib import ObjectSocket
 from pickle import dumps as pickle, loads as unpickle
 from struct import pack, unpack
+from traceback import format_exc
 import re, readline
 
 
@@ -67,7 +68,57 @@ class RemoteLauncher(Popen):
                 call(args)
         except:
             pass
-            
+
+
+def init_nodes(hosts):
+    launchers = []
+    for host, nodes in hosts.items():
+        try:
+            launchers.append(RemoteLauncher(host, nodes))
+        except:
+            for launcher in launchers:
+                launcher.terminate()
+            raise
+    try:
+        for launcher in launchers:
+            print(launcher, launcher.getpids())
+    except:
+        try:
+            for launcher in launchers:
+                launcher.terminate()
+        except:
+            pass
+        raise
+    nodes = {}
+    for host, info in hosts.items():
+        for id, port in info.items():
+            nodes[id] = {'host': host, 'port': port}
+    print(nodes)
+    for id, node in nodes.items():
+        host, port = node['host'], node['port']
+        s = ObjectSocket()
+        try:
+            s.connect((host, port))
+        except ConnectionError as ce:
+            print(ce, (host, port))
+        msg = {'total-node-count': len(nodes), 'nodes': [(i, n['host'], n['port']) for i, n in nodes.items() if i < id]}
+        print('Sending {} to {} ({}:{})'.format(msg, id, host, port))
+        s.sendobj(msg)
+        node['sock'] = s
+    return nodes
+    
+def command_loop(nodes):
+    regex = re.compile('^([0-9]+)\s+(.*)')
+    while True:
+        try:
+            string = input('-> ')
+        except (EOFError, KeyboardInterrupt):
+            for n in nodes.values():
+                n['sock'].sendobj('exit()')
+            return
+        m = regex.match(string)
+        if m:
+            nodes[int(m.group(1))]['sock'].sendobj(m.group(2))
 
 def main(procnum, hostnames):
     hosts = {}
@@ -78,54 +129,8 @@ def main(procnum, hostnames):
         if not host in hosts:
             hosts[host] = {}
         hosts[host][id] = 10000 + len(hosts[host])
-    launchers = []
-    error = None
-    for host, nodes in hosts.items():
-        try:
-            launchers.append(RemoteLauncher(host, nodes))
-        except Exception as e:
-            error = e
-            break
-    if error:
-        for launcher in launchers:
-            launcher.terminate()
-        print(error, file=sys.stderr)
-    else:
-        try:
-            for launcher in launchers:
-                print(launcher, launcher.getpids())
-        except:
-            try:
-                for launcher in launchers:
-                    launcher.terminate()
-            except:
-                pass
-            raise
-        nodes = {}
-        for host, info in hosts.items():
-            for id, port in info.items():
-                nodes[id] = {'host': host, 'port': port}
-        print(nodes)
-        for id, node in nodes.items():
-            host, port = node['host'], node['port']
-            s = ObjectSocket()
-            try:
-                s.connect((host, port))
-            except ConnectionError as ce:
-                print(ce, (host, port))
-            msg = {'total-node-count': len(nodes), 'nodes': [(i, n['host'], n['port']) for i, n in nodes.items() if i < id]}
-            print('Sending {} to {} ({}:{})'.format(msg, id, host, port))
-            s.sendobj(msg)
-            node['sock'] = s
-        command_loop(nodes)
-
-def command_loop(nodes):
-    regex = re.compile('^([0-9]+)\s+(.*)')
-    while True:
-        string = input('-> ')
-        m = regex.match(string)
-        if m:
-            nodes[int(m.group(1))]['sock'].sendobj(m.group(2))
+    nodes = init_nodes(hosts)
+    command_loop(nodes)
 
 
 if __name__ == '__main__':
